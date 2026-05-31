@@ -1,0 +1,22 @@
+# Python compilation files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Data and caches
+data_cache/
+test_cache/
+*.csv
+*.xlsx
+
+# IDEs and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
