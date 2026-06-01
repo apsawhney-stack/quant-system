@@ -34,7 +34,8 @@ class VolatilityEngine:
         regime: str,           # 'RISK_ON', 'NEUTRAL', 'RISK_OFF', 'PANIC'
         earnings_proximity: bool = False,
         prob_bull: float = 0.5,
-        prob_bear: float = 0.5
+        prob_bear: float = 0.5,
+        vix_val: float = 18.0
     ) -> Dict[str, Any]:
         """
         Maps inputs to optimal options strategies.
@@ -53,12 +54,14 @@ class VolatilityEngine:
                 iv_percentile,
                 regime,
                 earnings_proximity,
-                use_wide_buffer
+                use_wide_buffer,
+                meta_prob,
+                iv_rv_spread
             )
 
         # 1. PANIC Regime Override (Stateful panic block)
         if regime == "PANIC":
-            return self._hold_recommendation(ticker, "PANIC regime active. Entry blocked.", prob_bull, prob_bear, iv_percentile, regime, earnings_proximity, use_wide_buffer)
+            return self._hold_recommendation(ticker, "PANIC regime active. Entry blocked.", prob_bull, prob_bear, iv_percentile, regime, earnings_proximity, use_wide_buffer, meta_prob, iv_rv_spread)
             
         # 2. Level-2 Meta-Classifier Gate
         # Block trade if the success probability is below 50%
@@ -71,7 +74,9 @@ class VolatilityEngine:
                 iv_percentile,
                 regime,
                 earnings_proximity,
-                use_wide_buffer
+                use_wide_buffer,
+                meta_prob,
+                iv_rv_spread
             )
             
         # 3. Determine direction class from out-of-sample probability percentiles
@@ -94,28 +99,39 @@ class VolatilityEngine:
         rationale = ""
         is_premium_selling = False
 
+        # VRP spread threshold: lower to 0.02 for QQQ, 0.05 otherwise
+        vrp_threshold = 0.02 if ticker.upper() == "QQQ" else 0.05
+
         if direction == "BULLISH":
-            if iv_rv_spread > 0.05:
+            if iv_rv_spread > vrp_threshold:
                 strategy = "SELL_BULL_PUT_SPREAD"
                 rationale = f"Bullish signal with expensive IV (IV-RV: {iv_rv_spread*100:.2f}%). Sell bull put spread."
                 is_premium_selling = True
-            else:
+            elif vix_val < 13.0:
                 strategy = "BUY_CALL_DEBIT_SPREAD"
-                rationale = f"Bullish signal with cheap/fair IV (IV-RV: {iv_rv_spread*100:.2f}%). Buy call debit spread."
+                rationale = f"Bullish signal with low VIX ({vix_val:.1f} < 13). Buy call debit spread."
+                is_premium_selling = False
+            else:
+                strategy = "HOLD"
+                rationale = f"Bullish signal, but IV-RV spread ({iv_rv_spread*100:.2f}%) <= threshold ({vrp_threshold*100:.1f}%) and VIX ({vix_val:.1f}) >= 13."
                 is_premium_selling = False
 
         elif direction == "BEARISH":
-            if iv_rv_spread > 0.05:
+            if iv_rv_spread > vrp_threshold:
                 strategy = "SELL_BEAR_CALL_SPREAD"
                 rationale = f"Bearish signal with expensive IV (IV-RV: {iv_rv_spread*100:.2f}%). Sell bear call spread."
                 is_premium_selling = True
-            else:
+            elif vix_val < 13.0:
                 strategy = "BUY_PUT_DEBIT_SPREAD"
-                rationale = f"Bearish signal with cheap/fair IV (IV-RV: {iv_rv_spread*100:.2f}%). Buy put debit spread."
+                rationale = f"Bearish signal with low VIX ({vix_val:.1f} < 13). Buy put debit spread."
+                is_premium_selling = False
+            else:
+                strategy = "HOLD"
+                rationale = f"Bearish signal, but IV-RV spread ({iv_rv_spread*100:.2f}%) <= threshold ({vrp_threshold*100:.1f}%) and VIX ({vix_val:.1f}) >= 13."
                 is_premium_selling = False
 
         else: # NEUTRAL
-            if iv_rv_spread > 0.05:
+            if iv_rv_spread > vrp_threshold:
                 strategy = "SELL_IRON_CONDOR"
                 rationale = f"Neutral signal with expensive IV (IV-RV: {iv_rv_spread*100:.2f}%). Sell Iron Condor."
                 is_premium_selling = True
@@ -125,7 +141,7 @@ class VolatilityEngine:
                 is_premium_selling = False
             else:
                 strategy = "HOLD"
-                rationale = "Neutral signal. Volatility or regime conditions do not support premium selling or calendar trades."
+                rationale = f"Neutral signal, but IV-RV spread ({iv_rv_spread*100:.2f}%) <= threshold ({vrp_threshold*100:.1f}%) and stable vol conditions not met."
                 is_premium_selling = False
 
         # =========================================================================
@@ -163,7 +179,9 @@ class VolatilityEngine:
             "prob_bull": prob_bull,
             "prob_bear": prob_bear,
             "iv_percentile": iv_percentile,
-            "use_wide_buffer": use_wide_buffer
+            "use_wide_buffer": use_wide_buffer,
+            "meta_prob": meta_prob,
+            "iv_rv_spread": iv_rv_spread
         }
 
     def _hold_recommendation(
@@ -175,7 +193,9 @@ class VolatilityEngine:
         iv_percentile: float,
         regime: str = "NEUTRAL",
         earnings_proximity: bool = False,
-        use_wide_buffer: bool = False
+        use_wide_buffer: bool = False,
+        meta_prob: float = 0.50,
+        iv_rv_spread: float = 0.0
     ) -> Dict[str, Any]:
         """
         Helper to construct a standardized HOLD recommendation.
@@ -200,7 +220,9 @@ class VolatilityEngine:
             "prob_bull": prob_bull,
             "prob_bear": prob_bear,
             "iv_percentile": iv_percentile,
-            "use_wide_buffer": use_wide_buffer
+            "use_wide_buffer": use_wide_buffer,
+            "meta_prob": meta_prob,
+            "iv_rv_spread": iv_rv_spread
         }
 
 # =========================================================================
@@ -223,7 +245,8 @@ if __name__ == "__main__":
         iv_percentile=15.0,
         regime="RISK_ON",
         prob_bull=0.60,
-        prob_bear=0.30
+        prob_bear=0.30,
+        vix_val=12.0
     )
     print(f"Test 1: {res1['strategy']} - Rationale: {res1['rationale']}")
     assert res1['strategy'] == "BUY_CALL_DEBIT_SPREAD"
@@ -240,7 +263,8 @@ if __name__ == "__main__":
         iv_percentile=15.0,
         regime="RISK_ON",
         prob_bull=0.30,
-        prob_bear=0.60
+        prob_bear=0.60,
+        vix_val=12.0
     )
     print(f"Test 2: {res2['strategy']} - Rationale: {res2['rationale']}")
     assert res2['strategy'] == "BUY_PUT_DEBIT_SPREAD"

@@ -236,7 +236,8 @@ class OptionsBacktester:
                     regime=regime,
                     earnings_proximity=earnings_prox,
                     prob_bull=prob_bull,
-                    prob_bear=prob_bear
+                    prob_bear=prob_bear,
+                    vix_val=vix_val
                 )
                 
                 if rec['strategy'] != "HOLD":
@@ -331,13 +332,27 @@ class OptionsBacktester:
             days_held = (pd.to_datetime(date_str) - pd.to_datetime(pos['entry_date'])).days
             days_left = max(pos.get('short_dte', pos['initial_dte']) - days_held, 0)
             
-            # Volatility Profit Take: Short premium positions only
+            # Volatility profit/trailing stop tracking for short premium trades
             if pos.get('is_premium_selling', False) and 'entry_iv_percentile' in pos:
                 iv_contraction = pos['entry_iv_percentile'] - iv_percentile
+                
+                # Update peak observed IV contraction
+                max_contraction = max(pos.get('max_iv_contraction', 0.0), iv_contraction)
+                pos['max_iv_contraction'] = max_contraction
+                
+                # Exit Check A: Volatility Profit Take
                 if iv_contraction >= self.iv_contraction_threshold:
                     self._close_position(pos, date_str, spot_price, "VOL_PROFIT_TAKE", vix_val)
                     exited_positions.append(pos)
                     continue
+                
+                # Exit Check B: Volatility Trailing Stop
+                if max_contraction >= 15.0:
+                    reversal = max_contraction - iv_contraction
+                    if reversal >= 5.0:
+                        self._close_position(pos, date_str, spot_price, "VOL_TRAILING_STOP", vix_val)
+                        exited_positions.append(pos)
+                        continue
             
             # Retrieve cached option price and delta from _update_positions
             current_option_price = pos.get('current_option_price', 0.01)
@@ -349,7 +364,8 @@ class OptionsBacktester:
                 current_option_price=current_option_price,
                 current_short_strike_delta=short_delta,
                 days_to_expiry=days_left,
-                regime=regime
+                regime=regime,
+                current_date=date_str
             )
 
             if exit_trade:
@@ -360,6 +376,28 @@ class OptionsBacktester:
         if exited_positions:
             exited_set = set(id(pos) for pos in exited_positions)
             self.active_positions = [pos for pos in self.active_positions if id(pos) not in exited_set]
+
+    def _select_strike_by_delta(self, option_chain: pd.DataFrame, target_delta: float, is_call: bool, expiry: str) -> Optional[float]:
+        """
+        Finds the strike closest to target_delta from the option chain for a given type and expiry.
+        Applies vectorized logic to avoid O(N) loops.
+        """
+        if not all(col in option_chain.columns for col in ['type', 'expiry', 'delta', 'strike']):
+            return None
+        opt_type = 'call' if is_call else 'put'
+        sub_chain = option_chain[
+            (option_chain['type'] == opt_type) & 
+            (option_chain['expiry'] == expiry) & 
+            (option_chain['delta'].notna())
+        ]
+        if sub_chain.empty:
+            return None
+        
+        target_abs = abs(target_delta)
+        deltas = sub_chain['delta'].values
+        idx = np.argmin(np.abs(np.abs(deltas) - target_abs))
+        
+        return float(sub_chain.iloc[idx]['strike'])
 
     def _enter_trade(self, date_str: str, spot_price: float, rec: Dict[str, Any], pipeline: DataPipeline, vix_val: float):
         """
@@ -374,67 +412,13 @@ class OptionsBacktester:
         short_dte = 30
         long_dte = 30
         
-        # 1. Strike Selection with Volatility-Skew Buffer
-        if strategy in ["SELL_BULL_PUT_SPREAD", "SELL_NARROW_BULL_PUT_SPREAD"]:
-            if use_wide_buffer:
-                short_strike = round(spot_price * 0.94)
-                long_strike = round(spot_price * 0.91)
-            else:
-                short_strike = round(spot_price * 0.97)
-                long_strike = round(spot_price * 0.94)
-            spread_width = short_strike - long_strike
-            is_call = False
-            expected_legs = 2
-        elif strategy == "SELL_BEAR_CALL_SPREAD":
-            if use_wide_buffer:
-                short_strike = round(spot_price * 1.06)
-                long_strike = round(spot_price * 1.09)
-            else:
-                short_strike = round(spot_price * 1.03)
-                long_strike = round(spot_price * 1.06)
-            spread_width = long_strike - short_strike
-            is_call = True
-            expected_legs = 2
-        elif strategy == "SELL_IRON_CONDOR":
-            if use_wide_buffer:
-                short_put_strike = round(spot_price * 0.92)
-                long_put_strike = round(spot_price * 0.88)
-                short_call_strike = round(spot_price * 1.08)
-                long_call_strike = round(spot_price * 1.12)
-            else:
-                short_put_strike = round(spot_price * 0.96)
-                long_put_strike = round(spot_price * 0.92)
-                short_call_strike = round(spot_price * 1.04)
-                long_call_strike = round(spot_price * 1.08)
-            spread_width = max(short_put_strike - long_put_strike, long_call_strike - short_call_strike)
-            is_call = True  # dummy value
-            expected_legs = 4
-        elif strategy == "BUY_CALL_DEBIT_SPREAD":
-            long_strike = round(spot_price * 1.00)
-            short_strike = round(spot_price * 1.03)
-            spread_width = short_strike - long_strike
-            is_call = True
-            expected_legs = 2
-        elif strategy == "BUY_PUT_DEBIT_SPREAD":
-            long_strike = round(spot_price * 1.00)
-            short_strike = round(spot_price * 0.97)
-            spread_width = long_strike - short_strike
-            is_call = False
-            expected_legs = 2
-        elif strategy == "CALENDAR_SPREAD":
-            short_strike = round(spot_price)
-            long_strike = round(spot_price)
-            spread_width = 0.0
+        # 1. Option Expiry Setup
+        if strategy == "CALENDAR_SPREAD":
             short_dte = 14
             long_dte = 30
-            is_call = True
-            expected_legs = 2
         else:
-            short_strike = round(spot_price)
-            long_strike = round(spot_price * 0.98)
-            spread_width = short_strike - long_strike
-            is_call = True
-            expected_legs = 2
+            short_dte = 30
+            long_dte = 30
             
         iv_val = vix_val / 100.0 if not pd.isna(vix_val) else 0.18
         option_chain = pipeline.generate_synthetic_options_chain(ticker, date_str, spot_price, iv_val)
@@ -442,6 +426,105 @@ class OptionsBacktester:
         date_dt = pd.to_datetime(date_str)
         short_expiry = (date_dt + pd.Timedelta(days=short_dte)).strftime("%Y-%m-%d")
         long_expiry = (date_dt + pd.Timedelta(days=long_dte)).strftime("%Y-%m-%d")
+        
+        # 2. Strike Selection with Delta-Based Logic (BS Volatility-Sensitive)
+        if strategy in ["SELL_BULL_PUT_SPREAD", "SELL_NARROW_BULL_PUT_SPREAD"]:
+            is_call = False
+            short_strike = self._select_strike_by_delta(option_chain, 0.30, is_call, short_expiry)
+            long_strike = self._select_strike_by_delta(option_chain, 0.15, is_call, long_expiry)
+            
+            # Fallback to static percentage if search fails
+            if short_strike is None or long_strike is None or short_strike <= long_strike:
+                if use_wide_buffer:
+                    short_strike = round(spot_price * 0.94)
+                    long_strike = round(spot_price * 0.91)
+                else:
+                    short_strike = round(spot_price * 0.97)
+                    long_strike = round(spot_price * 0.94)
+                    
+            spread_width = short_strike - long_strike
+            expected_legs = 2
+            
+        elif strategy == "SELL_BEAR_CALL_SPREAD":
+            is_call = True
+            short_strike = self._select_strike_by_delta(option_chain, 0.30, is_call, short_expiry)
+            long_strike = self._select_strike_by_delta(option_chain, 0.15, is_call, long_expiry)
+            
+            if short_strike is None or long_strike is None or short_strike >= long_strike:
+                if use_wide_buffer:
+                    short_strike = round(spot_price * 1.06)
+                    long_strike = round(spot_price * 1.09)
+                else:
+                    short_strike = round(spot_price * 1.03)
+                    long_strike = round(spot_price * 1.06)
+                    
+            spread_width = long_strike - short_strike
+            expected_legs = 2
+            
+        elif strategy == "SELL_IRON_CONDOR":
+            short_put_strike = self._select_strike_by_delta(option_chain, 0.20, False, short_expiry)
+            long_put_strike = self._select_strike_by_delta(option_chain, 0.10, False, long_expiry)
+            short_call_strike = self._select_strike_by_delta(option_chain, 0.20, True, short_expiry)
+            long_call_strike = self._select_strike_by_delta(option_chain, 0.10, True, long_expiry)
+            
+            if None in [short_put_strike, long_put_strike, short_call_strike, long_call_strike] or short_put_strike <= long_put_strike or short_call_strike >= long_call_strike:
+                if use_wide_buffer:
+                    short_put_strike = round(spot_price * 0.92)
+                    long_put_strike = round(spot_price * 0.88)
+                    short_call_strike = round(spot_price * 1.08)
+                    long_call_strike = round(spot_price * 1.12)
+                else:
+                    short_put_strike = round(spot_price * 0.96)
+                    long_put_strike = round(spot_price * 0.92)
+                    short_call_strike = round(spot_price * 1.04)
+                    long_call_strike = round(spot_price * 1.08)
+                    
+            spread_width = max(short_put_strike - long_put_strike, long_call_strike - short_call_strike)
+            is_call = True  # dummy value
+            expected_legs = 4
+            
+        elif strategy == "BUY_CALL_DEBIT_SPREAD":
+            is_call = True
+            long_strike = self._select_strike_by_delta(option_chain, 0.50, is_call, long_expiry)
+            short_strike = self._select_strike_by_delta(option_chain, 0.30, is_call, short_expiry)
+            
+            if long_strike is None or short_strike is None or long_strike >= short_strike:
+                long_strike = round(spot_price * 1.00)
+                short_strike = round(spot_price * 1.03)
+                
+            spread_width = short_strike - long_strike
+            expected_legs = 2
+            
+        elif strategy == "BUY_PUT_DEBIT_SPREAD":
+            is_call = False
+            long_strike = self._select_strike_by_delta(option_chain, 0.50, is_call, long_expiry)
+            short_strike = self._select_strike_by_delta(option_chain, 0.30, is_call, short_expiry)
+            
+            if long_strike is None or short_strike is None or long_strike <= short_strike:
+                long_strike = round(spot_price * 1.00)
+                short_strike = round(spot_price * 0.97)
+                
+            spread_width = long_strike - short_strike
+            expected_legs = 2
+            
+        elif strategy == "CALENDAR_SPREAD":
+            is_call = True
+            short_strike = self._select_strike_by_delta(option_chain, 0.50, is_call, short_expiry)
+            long_strike = self._select_strike_by_delta(option_chain, 0.50, is_call, long_expiry)
+            
+            if short_strike is None or long_strike is None:
+                short_strike = round(spot_price)
+                long_strike = round(spot_price)
+                
+            spread_width = 0.0
+            expected_legs = 2
+            
+        else:
+            short_strike = round(spot_price)
+            long_strike = round(spot_price * 0.98)
+            spread_width = short_strike - long_strike
+            is_call = True
+            expected_legs = 2
         
         # 2. Query option chain legs individually to avoid row-indexing traps
         if strategy == "SELL_IRON_CONDOR":
@@ -515,7 +598,44 @@ class OptionsBacktester:
         if max_loss_per_contract <= 0:
             return
             
-        max_loss_dollars = self.net_liq * self.max_position_risk_pct
+        # Calculate empirical stats from trade_log for dynamic Kelly
+        if len(self.trade_log) >= 5:
+            closed_trades = self.trade_log
+            wins = [t['net_pnl'] for t in closed_trades if t['net_pnl'] > 0]
+            losses = [abs(t['net_pnl']) for t in closed_trades if t['net_pnl'] < 0]
+            
+            win_rate = len(wins) / len(closed_trades)
+            avg_win = sum(wins) / len(wins) if wins else 1.0
+            avg_loss = sum(losses) / len(losses) if losses else 1.0
+            empirical_wl_ratio = avg_win / avg_loss
+        else:
+            # Baseline fallbacks from historical stats
+            win_rate = 0.6286
+            empirical_wl_ratio = 0.85
+            
+        # Enforce safety boundaries to prevent division-by-zero or extreme numbers
+        empirical_wl_ratio = max(empirical_wl_ratio, 0.10)
+        
+        # Calculate raw Kelly percentage
+        raw_kelly = win_rate - ((1.0 - win_rate) / empirical_wl_ratio)
+        
+        # Enforce 10% fractional Kelly scaling and a minimum of 0.5% allocation
+        baseline_risk = max(0.005, raw_kelly * 0.10)
+        
+        # Scale dynamically by L2 meta-conviction (centered around 0.55 threshold)
+        conviction_mult = max(0.5, rec.get('meta_prob', 0.55) / 0.55)
+        
+        # Scale dynamically by active VRP spread (for premium selling only)
+        vrp_mult = 1.0
+        if is_premium_selling:
+            vrp_mult = 1.0 + max(0.0, rec.get('iv_rv_spread', 0.0) * 10.0)
+            
+        dynamic_risk_pct = baseline_risk * conviction_mult * vrp_mult
+        
+        # Apply strict institutional risk cap (2.5% max risk per trade)
+        dynamic_risk_pct = min(dynamic_risk_pct, 0.025)
+        
+        max_loss_dollars = self.net_liq * dynamic_risk_pct
         contracts = int(max_loss_dollars / max_loss_per_contract)
         
         if contracts <= 0:
@@ -576,6 +696,7 @@ class OptionsBacktester:
             "entry_premium": entry_premium,
             "is_premium_selling": is_premium_selling,
             "entry_iv_percentile": rec.get('iv_percentile', 50.0),
+            "max_iv_contraction": 0.0,
             "contracts": contracts,
             "margin_required": margin_required * contracts,
             "max_loss": max_loss_per_contract * contracts,

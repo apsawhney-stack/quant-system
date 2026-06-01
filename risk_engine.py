@@ -260,7 +260,8 @@ class RiskEngine:
         current_option_price: float,
         current_short_strike_delta: float,
         days_to_expiry: int,
-        regime: str
+        regime: str,
+        current_date: Optional[str] = None
     ) -> Tuple[bool, str]:
         """
         Determines if a trade should be liquidated early based on Greeks, profit targets, or regimes.
@@ -279,9 +280,24 @@ class RiskEngine:
         if days_to_expiry <= 7:
             return True, f"TIME_EXIT: {days_to_expiry} days to expiry remaining (gamma risk filter)."
             
+        # Decaying profit target calculation using calendar math
+        profit_target_pct = 0.70
+        if is_premium_selling and current_date is not None and 'entry_date' in position:
+            try:
+                from datetime import datetime
+                entry_dt = datetime.strptime(position['entry_date'], "%Y-%m-%d")
+                curr_dt = datetime.strptime(current_date, "%Y-%m-%d")
+                days_held = (curr_dt - entry_dt).days
+                initial_dte = position.get('initial_dte', 30)
+                if initial_dte > 0:
+                    time_decay_fraction = days_held / initial_dte
+                    profit_target_pct = 0.70 - (0.35 * min(time_decay_fraction, 1.0))
+            except Exception as e:
+                logger.error(f"Error calculating decaying profit target: {str(e)}")
+
         # Exit Rule 2: Profit Target
-        if is_premium_selling and pnl >= (entry_premium * 0.70 * contracts * 100):
-            return True, "PROFIT_TARGET: 70% of premium captured successfully."
+        if is_premium_selling and pnl >= (entry_premium * profit_target_pct * contracts * 100):
+            return True, f"PROFIT_TARGET: Dynamic {profit_target_pct*100:.1f}% profit target captured."
         elif not is_premium_selling:
             if position.get('strategy') == "CALENDAR_SPREAD":
                 if pnl >= (entry_premium * 0.30 * contracts * 100):
